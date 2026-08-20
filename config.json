@@ -1,0 +1,15 @@
+{
+    "sdk_path": "C:/Users/Admin/AppData/Local/Android/Sdk",
+    "bridge_script": "D:/doithontinthietbi/New folder/http2socks_bridge.py",
+    "bridge_port": 8080,
+    "port_base": 8081,
+    "default_proxy": "10.0.2.2:8080",
+    "socks5": {
+        "host": "14.224.225.153",
+        "port": 51653,
+        "user": "yAEnTj",
+        "password": "KMKoCt"
+    },
+    "supervisor_interval_sec": 10,
+    "boot_timeout_sec": 180
+}

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.log
+*.err.log
+*.out.log
+dist/
+release/
+nul
+*.apk
+startup.log
+bridge_*.log
+http*.log
