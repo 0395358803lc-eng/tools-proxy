@@ -1,223 +1,306 @@
-# -*- coding: utf-8 -*-
-"""
-HTTP <-> SOCKS5 bridge for Android emulator.
-Runs on the HOST. The Android http_proxy global setting only speaks HTTP,
-so this bridge accepts HTTP proxy requests (plain HTTP + HTTPS CONNECT) from
-the emulator and forwards them through a remote SOCKS5 proxy with auth.
-Each bridge instance serves ONE SOCKS5 proxy on ONE local port, so you can run
-multiple bridges (different ports + different SOCKS5) to give each emulator a
-different exit IP.
+from __future__ import annotations
 
-Usage:
-    python http2socks_bridge.py [listen_port]
-    python http2socks_bridge.py [listen_port] [socks_host] [socks_port] [socks_user] [socks_pass]
-"""
+import argparse
+import json
+import logging
+import signal
 import socket
 import threading
-import sys
-
-# ---- Configuration (co the ghi de bang doi so dong lenh) ----
-SOCKS5_HOST = "14.224.225.153"
-SOCKS5_PORT = 51653
-SOCKS5_USER = "yAEnTj"
-SOCKS5_PASS = "KMKoCt"
-
-LISTEN_HOST = "0.0.0.0"
-LISTEN_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
-
-# Ghi de SOCKS5 neu co tham so tu dong lenh
-if len(sys.argv) >= 5:
-    SOCKS5_HOST = sys.argv[2]
-    SOCKS5_PORT = int(sys.argv[3])
-    SOCKS5_USER = sys.argv[4]
-    SOCKS5_PASS = sys.argv[5] if len(sys.argv) >= 6 else ""
+from pathlib import Path
+from urllib.parse import urlsplit
 
 BUF_SIZE = 65536
-
-# ---- SOCKS5 helpers ---------------------------------------------------------
-def socks5_connect(sock, host, port):
-    """Perform a SOCKS5 handshake with username/password auth (RFC 1928/1929)."""
-    # greeting: version 5, 1 method (username/password, 0x02)
-    sock.sendall(b"\x05\x01\x02")
-    resp = _recv_exact(sock, 2)
-    if resp[0] != 0x05 or resp[1] != 0x02:
-        raise RuntimeError("SOCKS5 server did not accept username/password auth: %r" % resp)
-    # auth request: 0x01, ulen, uname, plen, passwd
-    u = SOCKS5_USER.encode(); p = SOCKS5_PASS.encode()
-    auth = b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p
-    sock.sendall(auth)
-    ares = _recv_exact(sock, 2)
-    if ares[0] != 0x01 or ares[1] != 0x00:
-        raise RuntimeError("SOCKS5 auth failed: %r" % ares)
-    # connect request: ver, cmd(1=connect), rsv(0), atyp
-    try:
-        import ipaddress
-        ip = ipaddress.ip_address(host)
-        if ip.version == 4:
-            atyp, host_b = 0x01, socket.inet_aton(host)
-        else:
-            atyp, host_b = 0x04, socket.inet_pton(socket.AF_INET6, host)
-    except ValueError:
-        h = host.encode()
-        atyp, host_b = 0x03, bytes([len(h)]) + h
-    port_b = port.to_bytes(2, "big")
-    req = b"\x05\x01\x00" + bytes([atyp]) + host_b + port_b
-    sock.sendall(req)
-    rep = _recv_exact(sock, 4)
-    if rep[0] != 0x05 or rep[1] != 0x00:
-        raise RuntimeError("SOCKS5 connect failed, reply=%r" % (rep,))
-    atyp = rep[3]
-    if atyp == 0x01:
-        _recv_exact(sock, 4)
-    elif atyp == 0x04:
-        _recv_exact(sock, 16)
-    elif atyp == 0x03:
-        ln = _recv_exact(sock, 1)[0]
-        _recv_exact(sock, ln)
-    _recv_exact(sock, 2)  # port
-    return True
+MAX_HEADER = 65536
+LOGGER = logging.getLogger("tools_proxy.bridge")
 
 
-def _recv_exact(sock, n):
-    data = b""
-    while len(data) < n:
-        chunk = sock.recv(n - len(data))
+def load_proxy(proxy_file: str | Path, proxy_id: str) -> dict:
+    path = Path(proxy_file)
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    item = data.get("proxies", {}).get(proxy_id)
+    if not isinstance(item, dict):
+        raise RuntimeError(f"proxy id {proxy_id!r} not found in {path}")
+    return {
+        "host": str(item["host"]),
+        "port": int(item["port"]),
+        "username": str(item.get("username", "")),
+        "password": str(item.get("password", "")),
+    }
+
+
+def recv_exact(sock: socket.socket, count: int) -> bytes:
+    data = bytearray()
+    while len(data) < count:
+        chunk = sock.recv(count - len(data))
         if not chunk:
             raise ConnectionResetError("connection closed mid-read")
-        data += chunk
-    return data
+        data.extend(chunk)
+    return bytes(data)
 
 
-# ---- Relay ---------------------------------------------------------------
-def _relay(a, b):
+def socks5_connect(sock: socket.socket, target_host: str, target_port: int, proxy: dict) -> None:
+    methods = [0x00]
+    if proxy["username"] or proxy["password"]:
+        methods = [0x02]
+    sock.sendall(bytes([0x05, len(methods), *methods]))
+    response = recv_exact(sock, 2)
+    if response[0] != 0x05 or response[1] == 0xFF:
+        raise RuntimeError("SOCKS5 server rejected authentication methods")
+
+    if response[1] == 0x02:
+        user = proxy["username"].encode("utf-8")
+        password = proxy["password"].encode("utf-8")
+        if len(user) > 255 or len(password) > 255:
+            raise RuntimeError("SOCKS5 username/password exceeds RFC 1929 limit")
+        sock.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(password)]) + password)
+        auth_response = recv_exact(sock, 2)
+        if auth_response != b"\x01\x00":
+            raise RuntimeError("SOCKS5 authentication failed")
+    elif response[1] != 0x00:
+        raise RuntimeError(f"unsupported SOCKS5 authentication method {response[1]}")
+
+    try:
+        packed = socket.inet_pton(socket.AF_INET, target_host)
+        address = b"\x01" + packed
+    except OSError:
+        try:
+            packed = socket.inet_pton(socket.AF_INET6, target_host)
+            address = b"\x04" + packed
+        except OSError:
+            encoded = target_host.encode("idna")
+            if len(encoded) > 255:
+                raise RuntimeError("target hostname is too long")
+            address = b"\x03" + bytes([len(encoded)]) + encoded
+
+    sock.sendall(b"\x05\x01\x00" + address + int(target_port).to_bytes(2, "big"))
+    reply = recv_exact(sock, 4)
+    if reply[0] != 0x05 or reply[1] != 0x00:
+        raise RuntimeError(f"SOCKS5 connect failed with reply code {reply[1]}")
+    atyp = reply[3]
+    if atyp == 0x01:
+        recv_exact(sock, 4)
+    elif atyp == 0x04:
+        recv_exact(sock, 16)
+    elif atyp == 0x03:
+        recv_exact(sock, recv_exact(sock, 1)[0])
+    else:
+        raise RuntimeError("invalid SOCKS5 bind address type")
+    recv_exact(sock, 2)
+
+
+def relay(source: socket.socket, target: socket.socket) -> None:
     try:
         while True:
-            data = a.recv(BUF_SIZE)
-            if not data:
+            chunk = source.recv(BUF_SIZE)
+            if not chunk:
                 break
-            b.sendall(data)
-    except Exception:
+            target.sendall(chunk)
+    except OSError:
         pass
     finally:
-        for s in (a, b):
-            try:
-                s.shutdown(socket.SHUT_WR)
-            except Exception:
-                pass
-
-
-def _forward_plain(client, http_req, target_host, target_port):
-    """Forward a plain (non-CONNECT) absolute-form HTTP request through SOCKS5."""
-    up = socket.create_connection((SOCKS5_HOST, SOCKS5_PORT), timeout=30)
-    try:
-        socks5_connect(up, target_host, target_port)
-        up.sendall(http_req)
-        up.shutdown(socket.SHUT_WR)
-        while True:
-            data = up.recv(BUF_SIZE)
-            if not data:
-                break
-            client.sendall(data)
-    finally:
         try:
-            up.close()
-        except Exception:
+            target.shutdown(socket.SHUT_WR)
+        except OSError:
             pass
 
 
-def handle(client):
-    try:
-        print("ACCEPT from %s" % (str(client.getpeername()),), flush=True)
-        client.settimeout(60)
-        data = b""
-        while b"\r\n\r\n" not in data and len(data) < 65536:
-            chunk = client.recv(4096)
-            if not chunk:
-                return
-            data += chunk
-        head, sep, _ = data.partition(b"\r\n\r\n")
+def read_request(client: socket.socket) -> bytes:
+    data = bytearray()
+    while b"\r\n\r\n" not in data:
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > MAX_HEADER:
+            raise RuntimeError("HTTP request headers exceed limit")
+    return bytes(data)
+
+
+def send_health(client: socket.socket, proxy_id: str, listen_host: str, listen_port: int) -> None:
+    body = json.dumps(
+        {
+            "service": "tools-proxy-bridge",
+            "proxy_id": proxy_id,
+            "listen_host": listen_host,
+            "listen_port": listen_port,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    response = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii")
+        + body
+    )
+    client.sendall(response)
+
+
+def parse_target(request_line: str, headers: list[str]) -> tuple[str, int, str, str]:
+    parts = request_line.split(" ", 2)
+    if len(parts) != 3:
+        raise RuntimeError("invalid HTTP request line")
+    method, target, version = parts
+    if method.upper() == "CONNECT":
+        if target.startswith("["):
+            host_part, _, port_part = target[1:].partition("]:")
+            return host_part, int(port_part), method, target
+        host, sep, port_raw = target.rpartition(":")
         if not sep:
-            head, sep, _ = data.partition(b"\n\n")
-            split_seq = b"\n\n"
-        else:
-            split_seq = b"\r\n\r\n"
-        head, _, _ = data.partition(split_seq)
-        lines = head.decode("iso-8859-1", "replace").split("\r\n")
-        if not lines or not lines[0]:
+            raise RuntimeError("CONNECT target must contain a port")
+        return host, int(port_raw), method, target
+
+    parsed = urlsplit(target)
+    if parsed.scheme and parsed.hostname:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return parsed.hostname, port, method, target
+
+    host_header = ""
+    for header in headers:
+        if header.lower().startswith("host:"):
+            host_header = header.split(":", 1)[1].strip()
+            break
+    if not host_header:
+        raise RuntimeError("request is missing Host header")
+    if host_header.startswith("["):
+        host, _, tail = host_header[1:].partition("]")
+        port = int(tail[1:]) if tail.startswith(":") else 80
+    elif ":" in host_header and host_header.rsplit(":", 1)[1].isdigit():
+        host, port_raw = host_header.rsplit(":", 1)
+        port = int(port_raw)
+    else:
+        host, port = host_header, 80
+    return host, port, method, target
+
+
+def rewrite_absolute_request(data: bytes) -> bytes:
+    head, separator, rest = data.partition(b"\r\n")
+    try:
+        method, target, version = head.decode("iso-8859-1").split(" ", 2)
+    except ValueError:
+        return data
+    parsed = urlsplit(target)
+    if not parsed.scheme or not parsed.hostname:
+        return data
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    return f"{method} {path} {version}".encode("iso-8859-1") + separator + rest
+
+
+def handle_client(
+    client: socket.socket,
+    proxy: dict,
+    proxy_id: str,
+    listen_host: str,
+    listen_port: int,
+    connection_slots: threading.BoundedSemaphore | None = None,
+) -> None:
+    try:
+        client.settimeout(60)
+        data = read_request(client)
+        if not data:
             return
+        header_text = data.split(b"\r\n\r\n", 1)[0].decode("iso-8859-1", "replace")
+        lines = header_text.split("\r\n")
         request_line = lines[0]
-        parts = request_line.split(" ")
-        if len(parts) < 2:
-            return
-        method, target = parts[0], parts[1]
-        print("REQ from %s -> %s %s" % (str(client.getpeername()), method, target), flush=True)
+        host, port, method, target = parse_target(request_line, lines[1:])
 
-        if method.upper() == "CONNECT":
-            host, _, port_s = target.rpartition(":")
-            port = int(port_s)
-            up = socket.create_connection((SOCKS5_HOST, SOCKS5_PORT), timeout=30)
-            try:
-                socks5_connect(up, host, port)
-                client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                t1 = threading.Thread(target=_relay, args=(client, up), daemon=True)
-                t2 = threading.Thread(target=_relay, args=(up, client), daemon=True)
-                t1.start(); t2.start()
-                t1.join(); t2.join()
-            finally:
-                try:
-                    up.close()
-                except Exception:
-                    pass
+        if host == "proxy.local" and target.startswith("http://proxy.local/__health__"):
+            send_health(client, proxy_id, listen_host, listen_port)
             return
 
-        # Plain HTTP absolute-form request
-        scheme = "http"
-        rest = target
-        if target.startswith("http://"):
-            rest = target[len("http://"):]
-        elif target.startswith("https://"):
-            scheme = "https"
-            rest = target[len("https://"):]
-        host = rest
-        port = 443 if scheme == "https" else 80
-        if "/" in host:
-            host, _, _ = host.partition("/")
-        if host.startswith("["):
-            hb, _, pb = host[1:].partition("]")
-            host = hb
-            if pb.startswith(":"):
-                port = int(pb[1:])
-        elif ":" in host:
-            h, _, ps = host.rpartition(":")
-            if ps.isdigit():
-                host, port = h, int(ps)
-        if not host:
-            return
-        _forward_plain(client, data, host, port)
-    except Exception:
+        upstream = socket.create_connection((proxy["host"], proxy["port"]), timeout=30)
+        upstream.settimeout(60)
         try:
-            client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-        except Exception:
+            socks5_connect(upstream, host, port, proxy)
+            if method.upper() == "CONNECT":
+                client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                first = threading.Thread(target=relay, args=(client, upstream), daemon=True)
+                second = threading.Thread(target=relay, args=(upstream, client), daemon=True)
+                first.start()
+                second.start()
+                first.join()
+                second.join()
+            else:
+                upstream.sendall(rewrite_absolute_request(data))
+                while True:
+                    chunk = upstream.recv(BUF_SIZE)
+                    if not chunk:
+                        break
+                    client.sendall(chunk)
+        finally:
+            upstream.close()
+    except Exception as exc:
+        LOGGER.warning("request failed on bridge %s: %s", proxy_id, exc)
+        try:
+            client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        except OSError:
             pass
     finally:
         try:
             client.close()
-        except Exception:
+        except OSError:
             pass
+        if connection_slots is not None:
+            connection_slots.release()
 
 
-def main():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((LISTEN_HOST, LISTEN_PORT))
-    srv.listen(128)
-    print("HTTP<->SOCKS5 bridge listening on %s:%d -> %s:%d (auth user=%s)" %
-          (LISTEN_HOST, LISTEN_PORT, SOCKS5_HOST, SOCKS5_PORT, SOCKS5_USER), flush=True)
-    while True:
-        conn, _ = srv.accept()
-        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Local HTTP to authenticated SOCKS5 bridge")
+    parser.add_argument("--listen-host", default="127.0.0.1")
+    parser.add_argument("--listen-port", type=int, required=True)
+    parser.add_argument("--proxy-file", required=True)
+    parser.add_argument("--proxy-id", required=True)
+    parser.add_argument("--max-connections", type=int, default=256)
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    proxy = load_proxy(args.proxy_file, args.proxy_id)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((args.listen_host, args.listen_port))
+    server.listen(128)
+    server.settimeout(1.0)
+    stop_event = threading.Event()
+    slots = threading.BoundedSemaphore(max(1, args.max_connections))
+
+    def request_stop(_signum, _frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, request_stop)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, request_stop)
+
+    LOGGER.info(
+        "bridge started proxy_id=%s listen=%s:%s max_connections=%s",
+        args.proxy_id, args.listen_host, args.listen_port, args.max_connections,
+    )
+    try:
+        while not stop_event.is_set():
+            try:
+                client, _ = server.accept()
+            except socket.timeout:
+                continue
+            if not slots.acquire(blocking=False):
+                try:
+                    client.sendall(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                finally:
+                    client.close()
+                continue
+            threading.Thread(
+                target=handle_client,
+                args=(client, proxy, args.proxy_id, args.listen_host, args.listen_port, slots),
+                daemon=True,
+            ).start()
+    finally:
+        server.close()
+        LOGGER.info("bridge stopped proxy_id=%s listen_port=%s", args.proxy_id, args.listen_port)
 
 
 if __name__ == "__main__":
     main()
-

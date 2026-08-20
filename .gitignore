@@ -1,12 +1,21 @@
 __pycache__/
-*.pyc
+*.py[cod]
 *.log
 *.err.log
 *.out.log
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
 dist/
+build/
 release/
-nul
 *.apk
-startup.log
-bridge_*.log
-http*.log
+
+# Local-only secrets and runtime state
+config.local.json
+proxies.local.json
+data/*.json
+!data/.gitkeep
+logs/*
+!logs/.gitkeep

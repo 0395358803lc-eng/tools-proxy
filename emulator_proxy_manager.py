@@ -1,448 +1,377 @@
-# -*- coding: utf-8 -*-
-"""
-emulator_proxy_manager.py
-Ung dung GUI (PySide6) quan ly Android emulators + tich hop proxy + tu dong hoa.
-Tinh nang:
-  - Liet ke so luong may ao (AVD).
-  - Tich hop proxy cho tung may ao (set/remove/test).
-  - Supervisor tu phuc hoi: bridge luon chay + proxy tu dat lai sau reboot.
-"""
+from __future__ import annotations
+
 import sys
-import os
-import json
-import time
 import threading
+import time
 
+from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTreeWidget, QTreeWidgetItem, QPushButton, QLabel, QTextEdit,
-    QGroupBox, QLineEdit, QCheckBox, QSpinBox, QSplitter, QMessageBox,
+    QApplication,
+    QCheckBox,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QSplitter,
+    QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
 
-# Danh ba thu muc core
-BASE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE)
-
-from core.emulator import EmulatorManager
-from core.proxy import ProxyManager
-from core.bridge import BridgeManager, BridgePool
-from core.autostart import Supervisor
-
-# ---------- Cấu hình ----------
-def _app_base():
-    """Khi dong goi exe, BASE la thu muc cua exe; khi chay .py la thu muc script."""
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+from core.logging_setup import configure_logging
+from core.models import SocksProxy
+from core.runtime import build_runtime
 
 
-BASE = _app_base()
-CONFIG_PATH = os.path.join(BASE, "config.json")
-
-
-def _resolve_bridge_script():
-    """Uu tien http2socks_bridge.exe (dong goi) neu co, nguoc lai .py."""
-    py_script = os.path.join(BASE, "http2socks_bridge.py")
-    exe_script = os.path.join(BASE, "http2socks_bridge.exe")
-    if os.path.exists(exe_script):
-        return exe_script
-    return py_script
-
-
-def load_config():
-    defaults = {
-        "sdk_path": "C:/Users/Admin/AppData/Local/Android/Sdk",
-        "bridge_script": _resolve_bridge_script(),
-        "bridge_port": 8080,
-        "default_proxy": "10.0.2.2:8080",
-        "socks5": {"host": "14.224.225.153", "port": 51653,
-                   "user": "yAEnTj", "password": "KMKoCt"},
-        "supervisor_interval_sec": 10,
-        "boot_timeout_sec": 180,
-    }
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            defaults.update(data)
-        except Exception:
-            pass
-    # Khi dong goi exe, luon phan giai lai bridge_script sang file .exe cung thu muc
-    if getattr(sys, "frozen", False):
-        defaults["bridge_script"] = _resolve_bridge_script()
-    return defaults
-
-
-CFG = load_config()
-
-# ---------- Bridge điều phối tín hiệu thread -> GUI ----------
-class WorkerSignals(QObject):
-    report = Signal(dict)       # supervisor report
+class UiSignals(QObject):
     log = Signal(str)
+    refresh = Signal()
+    refresh_data = Signal(object)
+    report = Signal(dict)
 
 
-# ---------- Worker supervisor chạy nền ----------
-class SupervisorWorker:
-    def __init__(self, supervisor, signals):
-        self.supervisor = supervisor
-        self.signals = signals
-
-    def run(self):
-        def cb(report):
-            self.signals.report.emit(report)
-        self.supervisor.callback = cb
-        self.supervisor.start()
-# ---------- Cửa sổ chính ----------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Android Emulator Proxy Manager")
-        self.resize(1050, 720)
+        self.signals = UiSignals()
+        self.runtime = build_runtime(callback=lambda report: self.signals.report.emit(report))
+        self.logger = configure_logging(self.runtime.config.log_dir)
+        self.selected_avd: str | None = None
+        self.avd_status: dict[str, dict] = {}
+        self._bridge_health: dict[str, dict] = {}
+        self._refreshing = False
 
-        # ---------- core ----------
-        self.emu = EmulatorManager(CFG["sdk_path"])
-        self.proxy = ProxyManager(CFG["sdk_path"], CFG["default_proxy"])
-        self.bridge = BridgeManager(CFG["bridge_script"], CFG["bridge_port"])
-        self.pool = BridgePool(CFG["bridge_script"], port_base=CFG.get("port_base", 8081))
-        self.supervisor = Supervisor(
-            self.bridge, self.emu, self.proxy, CFG["default_proxy"],
-            interval=CFG["supervisor_interval_sec"], enabled=True,
-            pool=self.pool, default_socks_port=CFG.get("bridge_port", 8080),
-        )
-        self.signals = WorkerSignals()
+        self.signals.log.connect(self._log)
+        self.signals.refresh.connect(self.refresh_emulators)
+        self.signals.refresh_data.connect(self._apply_refresh)
         self.signals.report.connect(self._on_report)
-        self.signals.log.connect(lambda m: self._log(m))
-        self.worker = SupervisorWorker(self.supervisor, self.signals)
-        self._super_thread = None
-        self.selected_avd = None
-        self.avd_status = {}
 
+        self.setWindowTitle("Android Emulator Proxy Manager")
+        self.resize(1120, 760)
         self._build_ui()
-        self._log("Khoi dong. SDK: " + CFG["sdk_path"])
+        self._log(f"SDK: {self.runtime.config.sdk_path or '(not configured)'}")
         self.refresh_emulators()
+        self.runtime.supervisor.start()
 
-    # ========== Xây GUI ==========
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(splitter, 1)
 
-        # ==== Cột trái: danh sách máy ảo ====
         left = QWidget()
-        lv = QVBoxLayout(left)
-        lv.setContentsMargins(0, 0, 0, 0)
-
-        hdr = QHBoxLayout()
-        hdr.addWidget(QLabel("<b>Danh sách máy ảo (AVD)</b>"))
-        self.lbl_count = QLabel("")
-        hdr.addWidget(self.lbl_count)
-        hdr.addStretch(1)
-        btn_refresh = QPushButton("Làm mới")
-        btn_refresh.clicked.connect(self.refresh_emulators)
-        hdr.addWidget(btn_refresh)
-        lv.addLayout(hdr)
+        left_layout = QVBoxLayout(left)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Android Virtual Devices</b>"))
+        self.count_label = QLabel("")
+        header.addWidget(self.count_label)
+        header.addStretch(1)
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self.refresh_emulators)
+        header.addWidget(refresh)
+        left_layout.addLayout(header)
 
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(4)
-        self.tree.setHeaderLabels(["Tên AVD", "Trạng thái", "Serial", "Proxy"])
-        self.tree.setColumnWidth(0, 150)
-        self.tree.setColumnWidth(1, 110)
-        self.tree.setColumnWidth(2, 120)
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(["AVD", "State", "Serial", "Android proxy", "Proxy ID"])
         self.tree.itemSelectionChanged.connect(self._on_select)
-        lv.addWidget(self.tree, 1)
+        left_layout.addWidget(self.tree, 1)
 
-        # ==== Chi tiết thao tác ====
-        det = QGroupBox("Thao tác máy ảo đang chọn")
-        dv = QVBoxLayout(det)
+        actions = QGroupBox("Selected AVD")
+        actions_layout = QVBoxLayout(actions)
+        buttons = QHBoxLayout()
+        self.boot_button = QPushButton("Boot")
+        self.assign_button = QPushButton("Assign proxy")
+        self.remove_button = QPushButton("Remove proxy")
+        self.test_button = QPushButton("Test exit IP")
+        self.boot_button.clicked.connect(self._boot_selected)
+        self.assign_button.clicked.connect(self._assign_selected)
+        self.remove_button.clicked.connect(self._remove_selected)
+        self.test_button.clicked.connect(self._test_selected)
+        for button in (self.boot_button, self.assign_button, self.remove_button, self.test_button):
+            buttons.addWidget(button)
+        actions_layout.addLayout(buttons)
 
-        row1 = QHBoxLayout()
-        self.btn_boot = QPushButton("Khởi động")
-        self.btn_set = QPushButton("Gán proxy (IP riêng)")
-        self.btn_remove = QPushButton("Gỡ proxy")
-        self.btn_test = QPushButton("Kiểm tra IP qua proxy")
-        self.btn_boot.clicked.connect(self._do_boot)
-        self.btn_set.clicked.connect(self._do_set_proxy)
-        self.btn_remove.clicked.connect(self._do_remove_proxy)
-        self.btn_test.clicked.connect(self._do_test_proxy)
-        for b in (self.btn_boot, self.btn_set, self.btn_remove, self.btn_test):
-            row1.addWidget(b)
-        dv.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Proxy SOCKS5 (host:port:user:pass):"))
-        self.ed_proxy = QLineEdit(CFG["default_proxy"])
-        self.ed_proxy.setPlaceholderText("vd: 14.224.225.153:51653:yAEnTj:KMKoCt")
-        row2.addWidget(self.ed_proxy, 1)
-        dv.addLayout(row2)
-        self.lbl_selected = QLabel("Chưa chọn máy ảo")
-        dv.addWidget(self.lbl_selected)
-
-        lv.addWidget(det)
+        proxy_row = QHBoxLayout()
+        proxy_row.addWidget(QLabel("SOCKS5:"))
+        self.proxy_input = QLineEdit()
+        self.proxy_input.setPlaceholderText("socks5://username:password@host:port")
+        self.proxy_input.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
+        proxy_row.addWidget(self.proxy_input, 1)
+        actions_layout.addLayout(proxy_row)
+        self.selection_label = QLabel("No AVD selected")
+        actions_layout.addWidget(self.selection_label)
+        left_layout.addWidget(actions)
         splitter.addWidget(left)
 
-        # ==== Cột phải: bridge + supervisor + log ====
         right = QWidget()
-        rv = QVBoxLayout(right)
-        rv.setContentsMargins(0, 0, 0, 0)
+        right_layout = QVBoxLayout(right)
+        supervisor_group = QGroupBox("Supervisor")
+        supervisor_layout = QVBoxLayout(supervisor_group)
+        supervisor_row = QHBoxLayout()
+        self.supervisor_checkbox = QCheckBox("Enable automatic recovery")
+        self.supervisor_checkbox.setChecked(True)
+        self.supervisor_checkbox.stateChanged.connect(self._toggle_supervisor)
+        supervisor_row.addWidget(self.supervisor_checkbox)
+        supervisor_row.addWidget(QLabel("Interval (s):"))
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(3, 300)
+        self.interval_spin.setValue(self.runtime.config.supervisor_interval_sec)
+        self.interval_spin.valueChanged.connect(self.runtime.supervisor.set_interval)
+        supervisor_row.addWidget(self.interval_spin)
+        run_once = QPushButton("Run now")
+        run_once.clicked.connect(self._supervise_once)
+        supervisor_row.addWidget(run_once)
+        supervisor_layout.addLayout(supervisor_row)
+        self.supervisor_label = QLabel("Supervisor running")
+        supervisor_layout.addWidget(self.supervisor_label)
+        right_layout.addWidget(supervisor_group)
 
-        # --- Bridge ---
-        gb_bridge = QGroupBox("Bridge HTTP→SOCKS5")
-        bv = QVBoxLayout(gb_bridge)
-        br_row = QHBoxLayout()
-        self.btn_bridge_start = QPushButton("Start bridge")
-        self.btn_bridge_stop = QPushButton("Stop bridge")
-        self.btn_bridge_status = QPushButton("Kiểm tra")
-        self.btn_bridge_start.clicked.connect(self._bridge_start)
-        self.btn_bridge_stop.clicked.connect(self._bridge_stop)
-        self.btn_bridge_status.clicked.connect(self._bridge_status)
-        for b in (self.btn_bridge_start, self.btn_bridge_stop, self.btn_bridge_status):
-            br_row.addWidget(b)
-        bv.addLayout(br_row)
-        self.lbl_bridge = QLabel("Bridge: --")
-        bv.addWidget(self.lbl_bridge)
-        rv.addWidget(gb_bridge)
+        bridge_group = QGroupBox("Bridge registry")
+        bridge_layout = QVBoxLayout(bridge_group)
+        self.bridge_text = QTextEdit()
+        self.bridge_text.setReadOnly(True)
+        self.bridge_text.setMaximumHeight(180)
+        bridge_layout.addWidget(self.bridge_text)
+        right_layout.addWidget(bridge_group)
 
-        # --- Supervisor ---
-        gb_sup = QGroupBox("Tự động hóa (Supervisor)")
-        sv = QVBoxLayout(gb_sup)
-        s_row = QHBoxLayout()
-        self.chk_supervisor = QCheckBox("Bật giám sát nền (tự phục hồi proxy)")
-        self.chk_supervisor.setChecked(True)
-        self.chk_supervisor.stateChanged.connect(self._toggle_supervisor)
-        s_row.addWidget(self.chk_supervisor)
-        s_row.addWidget(QLabel("Chu kỳ (s):"))
-        self.spin_interval = QSpinBox()
-        self.spin_interval.setRange(3, 300)
-        self.spin_interval.setValue(CFG["supervisor_interval_sec"])
-        self.spin_interval.valueChanged.connect(self._set_interval)
-        s_row.addWidget(self.spin_interval)
-        btn_run_once = QPushButton("Chạy ngay 1 vòng")
-        btn_run_once.clicked.connect(self._supervise_now)
-        s_row.addWidget(btn_run_once)
-        sv.addLayout(s_row)
-        self.lbl_supervisor = QLabel("Supervisor: chưa chạy")
-        sv.addWidget(self.lbl_supervisor)
-        rv.addWidget(gb_sup)
-
-        # --- Log ---
-        gb_log = QGroupBox("Nhật ký")
-        lv2 = QVBoxLayout(gb_log)
-        self.txt_log = QTextEdit()
-        self.txt_log.setReadOnly(True)
-        lv2.addWidget(self.txt_log)
-        rv.addWidget(gb_log, 1)
-
+        log_group = QGroupBox("Log")
+        log_layout = QVBoxLayout(log_group)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        log_layout.addWidget(self.log_text)
+        right_layout.addWidget(log_group, 1)
         splitter.addWidget(right)
-        splitter.setSizes([520, 530])
+        splitter.setSizes([650, 470])
 
-    # ========== Tiện ích log ==========
-    def _log(self, msg):
-        ts = time.strftime("%H:%M:%S")
-        self.txt_log.append(f"[{ts}] {msg}")
-        sb = self.txt_log.verticalScrollBar()
-        sb.setValue(sb.maximum())
+    def _run_worker(self, target, *args) -> None:
+        def wrapper():
+            try:
+                target(*args)
+            except Exception as exc:
+                self.signals.log.emit(f"ERROR: {exc}")
+            finally:
+                self.signals.refresh.emit()
 
-    # ========== Danh sách máy ảo ==========
-    def refresh_emulators(self):
+        threading.Thread(target=wrapper, daemon=True).start()
+
+    def _log(self, message: str) -> None:
+        text = f"[{time.strftime('%H:%M:%S')}] {message}"
+        self.log_text.append(text)
+        self.logger.info(message)
+        scroll = self.log_text.verticalScrollBar()
+        scroll.setValue(scroll.maximum())
+
+    def refresh_emulators(self) -> None:
+        if self._refreshing:
+            return
+        self._refreshing = True
+        threading.Thread(target=self._collect_refresh, daemon=True).start()
+
+    def _collect_refresh(self) -> None:
         try:
-            self.avd_status = self.emu.avd_status()
-        except Exception as e:
-            self._log(f"Lỗi refresh: {e}")
-            self.avd_status = {}
+            status = self.runtime.emulators.avd_status()
+            assignments = self.runtime.state.all_assignments()
+            current: dict[str, str] = {}
+            for avd, info in status.items():
+                if info.get("running") and info.get("booted") and info.get("serial"):
+                    result = self.runtime.proxy.get_proxy(info["serial"])
+                    current[avd] = result.proxy if result.success else "ADB error"
+                elif info.get("running"):
+                    current[avd] = "booting"
+                else:
+                    current[avd] = ""
+            health = self.runtime.registry.health()
+            self.signals.refresh_data.emit(
+                {"status": status, "assignments": assignments, "current": current, "health": health}
+            )
+        except Exception as exc:
+            self.signals.refresh_data.emit({"error": str(exc)})
+
+    def _apply_refresh(self, payload: dict) -> None:
+        self._refreshing = False
+        if payload.get("error"):
+            self._log(f"Refresh failed: {payload['error']}")
+            return
+        self.avd_status = payload["status"]
+        assignments = payload["assignments"]
+        current = payload["current"]
+        self._bridge_health = payload["health"]
         self.tree.clear()
         for avd, info in self.avd_status.items():
-            state = "đang chạy" if info["running"] else "tắt"
-            serial = info["serial"] or ""
-            proxy = ""
-            if info["running"] and info["booted"]:
-                try:
-                    proxy = self.proxy.get_proxy(info["serial"])
-                except Exception:
-                    proxy = "lỗi đọc"
-            elif info["running"]:
-                proxy = "đang boot..."
-            item = QTreeWidgetItem([avd, state, serial, proxy])
-            if info["running"]:
-                item.setForeground(1, Qt.GlobalColor.darkGreen)
-            else:
-                item.setForeground(1, Qt.GlobalColor.darkRed)
+            assignment = assignments.get(avd)
+            proxy_id = assignment.proxy_id if assignment else ""
+            state = "running" if info.get("running") else "stopped"
+            item = QTreeWidgetItem(
+                [avd, state, info.get("serial") or "", current.get(avd, ""), proxy_id]
+            )
+            item.setForeground(1, QColor("darkgreen" if info.get("running") else "darkred"))
             self.tree.addTopLevelItem(item)
-        self.lbl_count.setText(f"({len(self.avd_status)} máy ảo)")
+        self.count_label.setText(f"({len(self.avd_status)})")
+        self._render_bridge_health()
 
-    def _on_select(self):
+    def _render_bridge_health(self) -> None:
+        lines: list[str] = []
+        for proxy_id, item in self._bridge_health.items():
+            status = "healthy" if item["healthy"] else "down"
+            lines.append(f"{proxy_id} | port {item['port']} | {status}")
+        self.bridge_text.setPlainText("\n".join(lines) if lines else "No active assignments")
+
+    def _on_select(self) -> None:
         items = self.tree.selectedItems()
         if not items:
             self.selected_avd = None
-            self.lbl_selected.setText("Chưa chọn máy ảo")
+            self.selection_label.setText("No AVD selected")
             return
         self.selected_avd = items[0].text(0)
         info = self.avd_status.get(self.selected_avd, {})
-        running = info.get("running", False)
-        self.lbl_selected.setText(
-            f"Đã chọn: {self.selected_avd} | "
-            f"{'ĐANG CHẠY' if running else 'ĐANG TẮT'} | "
-            f"serial={info.get('serial') or '-'}")
+        self.selection_label.setText(
+            f"{self.selected_avd} | serial={info.get('serial') or '-'} | "
+            f"{'running' if info.get('running') else 'stopped'}"
+        )
 
-    def _selected_serial(self):
-        info = self.avd_status.get(self.selected_avd, {})
-        return info.get("serial")
-
-    # ========== Khởi động ==========
-    def _do_boot(self):
+    def _snapshot(self, require_running: bool = False) -> tuple[str, str | None] | None:
         avd = self.selected_avd
         if not avd:
-            QMessageBox.information(self, "Chú ý", "Hãy chọn một máy ảo.")
-            return
-        self._log(f"Đang khởi động AVD '{avd}' (không chờ boot)...")
-        threading.Thread(target=self._boot_worker, args=(avd,), daemon=True).start()
+            QMessageBox.information(self, "Select AVD", "Select an Android Virtual Device first.")
+            return None
+        serial = self.avd_status.get(avd, {}).get("serial")
+        if require_running and not serial:
+            QMessageBox.information(self, "AVD not running", "Boot the selected AVD first.")
+            return None
+        return avd, serial
 
-    def _boot_worker(self, avd):
+    def _boot_selected(self) -> None:
+        snapshot = self._snapshot()
+        if not snapshot:
+            return
+        avd, _ = snapshot
+        self._run_worker(self._boot_worker, avd)
+
+    def _boot_worker(self, avd: str) -> None:
+        result = self.runtime.emulators.boot_avd(avd)
+        if not result.success:
+            self.signals.log.emit(f"{avd}: boot failed: {result.error}")
+            return
+        self.signals.log.emit(result.stdout)
+        serial = self.runtime.emulators.wait_until_booted(
+            avd, timeout=self.runtime.config.boot_timeout_sec, poll=3
+        )
+        if not serial:
+            self.signals.log.emit(f"{avd}: boot timeout")
+            return
+        expected = self.runtime.registry.proxy_for_avd(avd)
+        if expected:
+            self.runtime.registry.ensure_all()
+            restored = self.runtime.proxy.ensure_proxy(serial, expected)
+            if not restored.success:
+                self.signals.log.emit(f"{avd}: proxy restore failed: {restored.error}")
+                return
+        self.signals.log.emit(f"{avd}: ready on {serial}")
+
+    def _assign_selected(self) -> None:
+        snapshot = self._snapshot(require_running=True)
+        if not snapshot:
+            return
+        raw = self.proxy_input.text().strip()
         try:
-            self.emu.boot_avd(avd)
-            self.signals.log.emit(f"Đã gửi lệnh khởi động {avd}. Chờ boot...")
-            serial = self.emu.serial_to_booted(avd, timeout=CFG["boot_timeout_sec"], poll=3)
-            if serial:
-                self.signals.log.emit(f"{avd} đã boot xong (serial {serial}).")
-                self.proxy.ensure_proxy(serial, CFG["default_proxy"])
-                self.signals.log.emit(f"Đã đảm bảo proxy cho {avd}: {self.proxy.get_proxy(serial)}")
-            else:
-                self.signals.log.emit(f"Chưa thấy {avd} boot xong trong {CFG['boot_timeout_sec']}s.")
-        except Exception as e:
-            self.signals.log.emit(f"Lỗi boot {avd}: {e}")
-        self.refresh_emulators()
+            parsed = SocksProxy.parse(raw)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid proxy", str(exc))
+            return
+        avd, serial = snapshot
+        self._run_worker(self._assign_worker, avd, str(serial), parsed)
 
-    # ========== Proxy ==========
-    def _do_set_proxy(self):
-        serial = self._selected_serial()
-        if not serial:
-            QMessageBox.information(self, "Chú ý", "Máy ảo này chưa chạy hoặc chưa chọn.")
+    def _assign_worker(self, avd: str, serial: str, parsed: SocksProxy) -> None:
+        proxy_id = self.runtime.proxies.upsert(parsed)
+        ok, message, port = self.runtime.registry.assign(avd, proxy_id)
+        if not ok or port is None:
+            self.signals.log.emit(f"{avd}: bridge failed: {message}")
             return
-        socks_str = self.ed_proxy.text().strip()
-        if not socks_str:
-            QMessageBox.information(self, "Chú ý",
-                                    "Hãy nhập proxy dạng host:port:user:pass\nvd: 14.224.225.153:51653:yAEnTj:KMKoCt")
+        expected = self.runtime.registry.proxy_for_avd(avd)
+        result = self.runtime.proxy.set_proxy(serial, expected)
+        if not result.success:
+            self.signals.log.emit(f"{avd}: ADB proxy failed: {result.error}")
             return
-        if not self.pool.socks_from_string(socks_str):
-            QMessageBox.warning(self, "Sai định dạng",
-                                "Chuỗi proxy phải có dạng host:port:user:pass")
-            return
-        # Chạy nền để không treo GUI khi khởi động bridge
-        threading.Thread(target=self._set_proxy_worker, args=(serial, socks_str), daemon=True).start()
-
-    def _set_proxy_worker(self, serial, socks_str):
-        self.signals.log.emit(f"Đang chuẩn bị bridge + gán proxy riêng cho {self.selected_avd} ...")
-        port, proxy_str = self.pool.assign_proxy(self.selected_avd, socks_str)
-        if not proxy_str:
-            self.signals.log.emit(f"❌ Không tạo được bridge cho proxy {socks_str}")
-            return
-        self.proxy.set_proxy(serial, proxy_str)
         self.signals.log.emit(
-            f"✅ {self.selected_avd}: gán proxy {proxy_str} "
-            f"(SOCKS5 {socks_str}, bridge port {port})")
-        self.refresh_emulators()
+            f"{avd}: assigned {parsed.redacted()} via {expected} ({proxy_id})"
+        )
 
-    def _do_remove_proxy(self):
-        serial = self._selected_serial()
-        if not serial:
-            QMessageBox.information(self, "Chú ý", "Máy ảo này chưa chạy hoặc chưa chọn.")
+    def _remove_selected(self) -> None:
+        snapshot = self._snapshot()
+        if not snapshot:
             return
-        ok, msg = self.pool.remove_avd(self.selected_avd)
-        self.proxy.remove_proxy(serial)
-        self._log(f"Đã gỡ proxy cho {self.selected_avd} ({serial}) - {msg}")
-        self.refresh_emulators()
+        avd, serial = snapshot
+        self._run_worker(self._remove_worker, avd, serial)
 
-    def _do_test_proxy(self):
-        serial = self._selected_serial()
-        if not serial:
-            QMessageBox.information(self, "Chú ý", "Máy ảo này chưa chạy hoặc chưa chọn.")
+    def _remove_worker(self, avd: str, serial: str | None) -> None:
+        if serial:
+            result = self.runtime.proxy.remove_proxy(serial)
+            if not result.success:
+                self.signals.log.emit(f"{avd}: Android proxy clear failed: {result.error}")
+        ok, message = self.runtime.registry.remove(avd)
+        self.signals.log.emit(message if ok else f"{avd}: {message}")
+
+    def _test_selected(self) -> None:
+        snapshot = self._snapshot()
+        if not snapshot:
             return
-        # test qua port cua proxy da gan cho AVD nay
-        port = self.pool.port_for_avd(self.selected_avd)
+        avd, _ = snapshot
+        port = self.runtime.registry.port_for_avd(avd)
         if port is None:
-            QMessageBox.information(self, "Chú ý",
-                                    "Máy ảo này chưa được gán proxy qua pool. Hãy bấm 'Gán proxy (IP riêng)' trước.")
+            QMessageBox.information(self, "No proxy", "Assign a proxy to this AVD first.")
             return
-        self._log(f"Kiểm tra proxy {self.selected_avd} (port {port}) ...")
-        threading.Thread(target=self._test_worker, args=(serial, port), daemon=True).start()
+        self._run_worker(self._test_worker, avd, port)
 
-    def _test_worker(self, serial, port):
-        ok, res = self.proxy.test_proxy_port(serial, port)
+    def _test_worker(self, avd: str, port: int) -> None:
+        self.runtime.registry.ensure_all()
+        ok, detail = self.runtime.proxy.test_proxy_port(port, self.runtime.config.proxy_test_url)
         if ok:
-            self.signals.log.emit(f"✅ {self.selected_avd} proxy hoạt động - IP ra ngoài: {res}")
+            self.signals.log.emit(f"{avd}: bridge exit IP = {detail}")
         else:
-            self.signals.log.emit(f"❌ {self.selected_avd} proxy lỗi: {res}")
+            self.signals.log.emit(f"{avd}: bridge test failed: {detail}")
 
-    # ========== Bridge ==========
-    def _bridge_start(self):
-        ok, msg = self.bridge.start()
-        self._log("Start bridge: " + msg)
-        self._bridge_status()
+    def _toggle_supervisor(self, state: int) -> None:
+        enabled = state == Qt.CheckState.Checked.value
+        self.runtime.supervisor.enabled = enabled
+        self.supervisor_label.setText("Supervisor running" if enabled else "Supervisor paused")
+        self._log(f"Supervisor {'enabled' if enabled else 'paused'}")
 
-    def _bridge_stop(self):
-        msg = self.bridge.stop()
-        self._log("Stop bridge: " + msg)
-        self._bridge_status()
+    def _supervise_once(self) -> None:
+        self._run_worker(self._supervise_worker)
 
-    def _bridge_status(self):
-        ok, msg = self.bridge.status()
-        color = "xanh" if ok else "đỏ"
-        self.lbl_bridge.setText(f"Bridge: {msg} ({color})")
-        self._log("Status bridge: " + msg)
+    def _supervise_worker(self) -> None:
+        report = self.runtime.supervisor.supervise_once()
+        self.signals.report.emit(report)
 
-    # ========== Supervisor ==========
-    def _toggle_supervisor(self, state):
-        enabled = (state == Qt.CheckState.Checked.value)
-        self.supervisor.enabled = enabled
-        self._log(f"Supervisor {'BẬT' if enabled else 'TẮT'}")
-        if enabled and (not self._super_thread or not self._super_thread.is_alive()):
-            self._start_supervisor_thread()
-
-    def _start_supervisor_thread(self):
-        self._super_thread = threading.Thread(target=self.worker.run, daemon=True)
-        self._super_thread.start()
-        self.lbl_supervisor.setText("Supervisor: ĐANG CHẠY (giám sát nền)")
-        self._log("Supervisor đã bắt đầu chạy nền.")
-
-    def _set_interval(self, val):
-        self.supervisor.set_interval(val)
-        self._log(f"Chu kỳ supervisor = {val}s")
-
-    def _supervise_now(self):
-        report = self.supervisor.supervise_once()
-        self._on_report(report)
-
-    def _on_report(self, report):
-        br = report.get("bridge_running")
-        if br is not None:
-            self.lbl_bridge.setText(f"Bridge: {'ĐANG CHẠY' if br else 'TẮT'}")
-        for kind, msg in report.get("actions", []):
-            if kind == "bridge":
-                self._log("[tự] Bridge: " + msg)
-            elif kind == "proxy":
-                self._log("[tự] Proxy: " + msg)
-        changed = any(a[0] == "proxy" for a in report.get("actions", []))
-        if changed:
+    def _on_report(self, report: dict) -> None:
+        for kind, message in report.get("actions", []):
+            self._log(f"[{kind}] {message}")
+        if "bridges" in report:
+            self._bridge_health = report["bridges"]
+            self._render_bridge_health()
+        if report.get("actions"):
             self.refresh_emulators()
 
-    def closeEvent(self, event):
-        self.supervisor.stop()
+    def closeEvent(self, event) -> None:
+        self.runtime.supervisor.stop()
         event.accept()
 
 
-# ========== Main ==========
-def main():
+def main() -> int:
     app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
-    if win.chk_supervisor.isChecked():
-        win._start_supervisor_thread()
-    sys.exit(app.exec())
+    window = MainWindow()
+    window.show()
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
-
+    raise SystemExit(main())
