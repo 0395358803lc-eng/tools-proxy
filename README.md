@@ -1,71 +1,157 @@
 # Android Emulator Proxy Manager
 
-Ứng dụng **Python GUI (PySide6)** quản lý máy ảo Android và tích hợp proxy tự động.
-Hỗ trợ **mỗi máy ảo một địa chỉ IP proxy riêng**.
+`tools-proxy` manages Android Studio AVDs and gives each assigned AVD a local HTTP proxy that
+forwards traffic through an authenticated SOCKS5 proxy.
 
-## Tính năng
+## Architecture
 
-- **Liệt kê máy ảo (AVD)**: Hiển thị số lượng AVD, trạng thái (chạy/tắt), serial, proxy hiện tại.
-- **Tích hợp proxy riêng cho từng máy ảo**:
-  - Nhập proxy dạng `host:port:user:pass` (SOCKS5).
-  - Mỗi máy ảo được gán một proxy => tự động tạo một bridge riêng (cổng riêng) => **IP thoát ra khác nhau**.
-  - Khởi động / gán proxy / gỡ proxy / kiểm tra IP qua proxy.
-- **Tự động hóa (Supervisor)**: Giám sát nền liên tục để đảm bảo:
-  - Các bridge HTTP→SOCKS5 **luôn chạy** (tự khởi động lại nếu tắt).
-  - Proxy của từng máy ảo **tự đặt lại** sau khi máy ảo tắt/bật lại (theo đúng proxy đã gán).
-
-## Cấu trúc
-
-```
-emulator_proxy_manager.py   # Entry point + GUI (chạy chính)
-core/
-  emulator.py               # Liệt kê AVD, detect trạng thái, boot
-  proxy.py                  # Đọc/ghi/gỡ/test proxy
-  bridge.py                 # BridgeManager (1 bridge) + BridgePool (nhiều bridge, mỗi AVD 1 IP)
-  autostart.py              # Supervisor tự phục hồi (thread nền)
-config.json                 # Cấu hình (SDK path, proxy SOCKS5, port...)
+```text
+Android AVD
+   |
+   | global http_proxy = 10.0.2.2:<local-port>
+   v
+HTTP bridge on Windows (127.0.0.1:<local-port>)
+   |
+   v
+Remote SOCKS5 proxy
+   |
+   v
+Internet
 ```
 
-## Cài đặt
+Each SOCKS5 identity gets a bridge port. AVD-to-proxy assignments are persisted in
+`data/state.json`. SOCKS5 credentials are stored only in the local, Git-ignored
+`proxies.local.json` file.
+
+The Supervisor continuously checks all persisted assignments. It restarts missing bridges and
+restores an AVD's Android `http_proxy` whenever the value is missing, `null`, or incorrect.
+
+## Requirements
+
+- Windows 10/11 for the intended Android Studio workflow
+- Python 3.11+
+- Android SDK with `adb` and `emulator`
+- PySide6 for the GUI
+
+Install:
 
 ```powershell
-pip install PySide6 requests
+python -m pip install -e .
 ```
 
-## Chạy
+For development:
 
 ```powershell
-cd "D:\doithontinthietbi\New folder"
+python -m pip install -e ".[dev]"
+pytest
+ruff check .
+```
+
+## Configuration
+
+Copy the template if machine-specific settings are required:
+
+```powershell
+Copy-Item config.example.json config.local.json
+```
+
+`config.local.json` is ignored by Git. The SDK path can also be supplied with
+`ANDROID_SDK_ROOT`, `ANDROID_HOME`, or `TOOLS_PROXY_SDK_PATH`.
+
+Important settings:
+
+| Key | Meaning |
+|---|---|
+| `sdk_path` | Android SDK path; may be left empty when environment variables are set |
+| `bridge_bind_host` | Bridge bind address; defaults to `127.0.0.1` |
+| `port_base` | First dynamically allocated bridge port |
+| `emulator_gateway` | Android Emulator alias for the host, normally `10.0.2.2` |
+| `supervisor_interval_sec` | Recovery interval |
+| `boot_timeout_sec` | Maximum AVD boot wait |
+| `proxy_test_url` | Plain-HTTP endpoint used for bridge exit-IP testing |
+
+## GUI
+
+```powershell
 python emulator_proxy_manager.py
 ```
 
-## Cấu hình (`config.json`)
+1. Select an AVD.
+2. Boot it if necessary.
+3. Enter a proxy as `socks5://username:password@host:port`.
+4. Select **Assign proxy**.
+5. Use **Test exit IP** to validate the host bridge.
 
-| Khóa | Ý nghĩa |
-|---|---|
-| `sdk_path` | Đường dẫn Android SDK (chứa adb + emulator) |
-| `bridge_script` | Đường dẫn script cầu nối HTTP→SOCKS5 |
-| `bridge_port` | Cổng bridge mặc định (8080) |
-| `port_base` | Cổng khởi đầu cho pool proxy riêng (8081, 8082...) |
-| `default_proxy` | Proxy mặc định (`10.0.2.2:8080`) |
-| `socks5` | Thông tin proxy SOCKS5 mặc định |
-| `supervisor_interval_sec` | Chu kỳ giám sát nền (giây) |
-| `boot_timeout_sec` | Thời gian chờ máy ảo boot (giây) |
+The legacy `host:port:user:password` input format is accepted for compatibility, but URI format
+is preferred.
 
-## Cách dùng GUI
+## CLI
 
-1. Mở ứng dụng → bảng máy ảo tự nạp danh sách AVD.
-2. Chọn một máy ảo.
-3. Ở ô **"Proxy SOCKS5"** nhập proxy dạng `host:port:user:pass`
-   (vd `14.224.225.153:51653:yAEnTj:KMKoCt`).
-4. Bấm **"Gán proxy (IP riêng)"** → một bridge riêng (cổng mới) tự tạo, proxy gán cho máy ảo đó.
-5. Bấm **"Kiểm tra IP qua proxy"** để xem IP thoát ra.
-6. Lặp lại với máy ảo khác và proxy khác => mỗi máy ảo có IP riêng.
-7. Bật **Supervisor** để tự động hóa (proxy bền vững sau reboot).
+```powershell
+python app.py list
+python app.py boot Phone_01
+python app.py assign Phone_01 "socks5://user:password@proxy.example:1080"
+python app.py test Phone_01
+python app.py status
+python app.py remove Phone_01
+python app.py supervisor
+```
 
-## Ghi chú
+CLI output never intentionally prints the SOCKS5 password.
 
-- Mỗi proxy SOCKS5 khác nhau sẽ chiếm một cổng bridge riêng (8081, 8082...).
-- Nếu 2 máy ảo dùng **cùng** một proxy, chúng dùng chung bridge (cùng IP).
-- Phạm vi proxy: HTTP/HTTPS (giới hạn của cơ chế `http_proxy` Android).
+## Windows startup
 
+`Start-EmulatorWithProxy.ps1` is now only a bootstrap layer; proxy and emulator business logic
+lives in Python.
+
+Register the Supervisor at logon:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Install-Startup.ps1
+```
+
+Remove the shortcut:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\Uninstall-Startup.ps1
+```
+
+## Recovery behavior
+
+At startup and on every supervisor cycle:
+
+1. Load persistent AVD assignments.
+2. Verify every assigned bridge using its internal health endpoint.
+3. Start a missing bridge. If its saved port is occupied by another service, allocate a new port
+   and update all AVDs sharing that proxy.
+4. Detect running and fully booted AVDs by `ro.boot.qemu.avd_name`.
+5. Compare Android `global http_proxy` with the persisted expected value.
+6. Restore the value whenever it differs, including `null` and empty values.
+
+## Security
+
+- No production SOCKS5 credential belongs in Git.
+- `proxies.local.json` and `config.local.json` are Git-ignored.
+- The bridge defaults to `127.0.0.1`, not `0.0.0.0`.
+- The bridge command line contains a proxy ID, not a username/password.
+- Rotate any credential that was exposed in an older public revision; deleting it from the latest
+  revision does not erase Git history.
+
+See `SECURITY.md`.
+
+## Traffic validation and WhatsApp limitation
+
+`python app.py test <AVD>` validates the Windows HTTP-to-SOCKS bridge and its exit IP. It does
+**not** prove that every packet generated by an Android application uses Android's global HTTP
+proxy.
+
+Before treating this as per-WhatsApp network isolation, validate traffic from inside each AVD and
+capture real application traffic. In particular, test HTTP, HTTPS/TCP and any UDP/QUIC traffic
+used by the target application. Android `global http_proxy` is not a transparent VPN and should
+not be assumed to intercept all protocols.
+
+## Tests
+
+The repository includes unit tests for configuration, proxy parsing, persistent state, AVD
+mapping, ADB proxy verification, Supervisor recovery and a real local bridge health process.
+GitHub Actions runs `ruff`, `pytest`, and `compileall` on each push and pull request.

@@ -1,108 +1,112 @@
-# -*- coding: utf-8 -*-
-"""
-core/autostart.py
-Lop Supervisor: theo doi lien tuc (thread nen) de dam bao:
-  - Bridge luon chay (tu khoi dong lai neu tat).
-  - Du proxy duoc dat cho tung emulator dang chay (tu set lai neu bi mat).
-Phat tín hieu (callback) moi vong de GUI cap nhat nhanh.
-"""
-import time
+from __future__ import annotations
+
 import threading
+import time
+from collections.abc import Callable
+
+from .bridge import BridgeRegistry
+from .emulator import EmulatorManager
+from .proxy import ProxyManager
+from .state import StateStore
 
 
 class Supervisor:
-    def __init__(self, bridge_mgr, emu_mgr, proxy_mgr, default_proxy,
-                 interval=10, callback=None, enabled=True, pool=None,
-                 default_socks_port=8080):
-        self.bridge = bridge_mgr
-        self.emu = emu_mgr
-        self.proxy = proxy_mgr
-        self.default_proxy = default_proxy
-        self.pool = pool                     # BridgePool (co the None)
-        self.default_socks_port = default_socks_port
-        self.interval = interval
-        self.callback = callback          # callback(dict_report)
+    def __init__(
+        self,
+        registry: BridgeRegistry,
+        emulators: EmulatorManager,
+        proxy: ProxyManager,
+        state: StateStore,
+        interval: int = 10,
+        callback: Callable[[dict], None] | None = None,
+        enabled: bool = True,
+    ):
+        self.registry = registry
+        self.emulators = emulators
+        self.proxy = proxy
+        self.state = state
+        self.interval = max(1, int(interval))
+        self.callback = callback
         self.enabled = enabled
         self._stop = threading.Event()
-        self._thread = None
+        self._thread: threading.Thread | None = None
 
-    # ---------- điều khiển ----------
-    def start(self):
+    def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=self._loop, name="proxy-supervisor", daemon=True)
         self._thread.start()
 
-    def stop(self):
+    def stop(self) -> None:
         self._stop.set()
+        if self._thread and self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=2)
 
-    def set_interval(self, sec):
-        self.interval = sec
+    def set_interval(self, seconds: int) -> None:
+        self.interval = max(1, int(seconds))
 
-    # ---------- vòng lặp ----------
-    def _loop(self):
+    def _loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                if self.enabled:
+            if self.enabled:
+                try:
                     report = self.supervise_once()
                     if self.callback:
                         self.callback(report)
-            except Exception:
-                pass
-            # cho den interval hoac bi stop
+                except Exception as exc:
+                    if self.callback:
+                        self.callback(
+                            {
+                                "timestamp": time.strftime("%H:%M:%S"),
+                                "error": str(exc),
+                                "actions": [],
+                            }
+                        )
             self._stop.wait(self.interval)
 
-    # ---------- một vòng giám sát ----------
-    def supervise_once(self):
-        """Kiem tra bridge + proxy cua moi emulator dang chay. Tra ve dict."""
+    def supervise_once(self) -> dict:
         report = {
             "timestamp": time.strftime("%H:%M:%S"),
-            "bridge_running": self.bridge._port_listening(),
+            "bridges": {},
             "emulators": {},
             "actions": [],
         }
+        report["actions"].extend(self.registry.ensure_all())
+        report["bridges"] = self.registry.health()
 
-        # 1) Dam bao bridge chay
-        if not report["bridge_running"]:
-            ok, msg = self.bridge.start()
-            report["actions"].append(("bridge", msg))
-            report["bridge_running"] = self.bridge._port_listening()
-
-        # 2) Dam bao proxy cho tung emulator dang chay
         try:
-            status = self.emu.avd_status()
-        except Exception:
+            status = self.emulators.avd_status()
+        except Exception as exc:
+            report["actions"].append(("emulator_error", str(exc)))
             status = {}
-        for avd, info in status.items():
+
+        assignments = self.state.all_assignments()
+        for avd in assignments:
+            info = status.get(avd, {"running": False, "booted": False, "serial": None})
             entry = {
-                "avd": avd,
-                "running": info["running"],
-                "booted": info["booted"],
+                "running": bool(info.get("running")),
+                "booted": bool(info.get("booted")),
+                "serial": info.get("serial"),
+                "expected_proxy": self.registry.proxy_for_avd(avd),
                 "proxy": None,
                 "ok": False,
             }
-            # Xac dinh proxy mong doi cho AVD nay
-            expected = self.default_proxy
-            if self.pool is not None:
-                p = self.pool.proxy_for_avd(avd)
-                if p:
-                    expected = p
-            if info["running"] and info["booted"]:
-                serial = info["serial"]
-                try:
-                    cur = self.proxy.get_proxy(serial)
-                    entry["proxy"] = cur
-                    if cur != expected and cur not in ("null", ""):
-                        # set lai
-                        self.proxy.set_proxy(serial, expected)
-                        cur = self.proxy.get_proxy(serial)
-                        report["actions"].append(("proxy", f"{avd}: reset -> {cur}"))
-                    entry["proxy"] = cur
-                    entry["ok"] = (cur == expected)
-                except Exception as e:
-                    entry["proxy"] = f"ERR {e}"
-            elif info["running"]:
-                entry["proxy"] = "dang boot..."
+            if entry["running"] and entry["booted"] and entry["serial"]:
+                current = self.proxy.get_proxy(entry["serial"])
+                entry["proxy"] = current.proxy
+                if not current.success:
+                    report["actions"].append(("proxy_error", f"{avd}: {current.error}"))
+                elif current.proxy != entry["expected_proxy"]:
+                    restored = self.proxy.set_proxy(entry["serial"], entry["expected_proxy"])
+                    entry["proxy"] = restored.proxy
+                    entry["ok"] = restored.success
+                    if restored.success:
+                        report["actions"].append(("proxy", f"{avd}: restored {restored.proxy}"))
+                    else:
+                        report["actions"].append(("proxy_error", f"{avd}: {restored.error}"))
+                else:
+                    entry["ok"] = True
+            elif entry["running"]:
+                entry["proxy"] = "booting"
             report["emulators"][avd] = entry
         return report
