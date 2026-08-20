@@ -89,5 +89,10 @@ class ProxyManager:
         except Exception as exc:
             return False, str(exc)
 
-    def test_proxy_port(self, port: int, url: str = "http://api.ipify.org", timeout: int = 15) -> tuple[bool, str]:
+    def test_proxy_port(
+        self,
+        port: int,
+        url: str = "http://api.ipify.org",
+        timeout: int = 15,
+    ) -> tuple[bool, str]:
         return self._http_get_via_port(port, url, timeout)

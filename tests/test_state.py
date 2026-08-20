@@ -1,5 +1,3 @@
-import json
-
 from core.models import Assignment, SocksProxy
 from core.state import ProxyStore, StateStore
 

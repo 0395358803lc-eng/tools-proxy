@@ -28,7 +28,7 @@ class SocksProxy:
     password: str
 
     @classmethod
-    def parse(cls, raw: str) -> "SocksProxy":
+    def parse(cls, raw: str) -> SocksProxy:
         value = raw.strip()
         if not value:
             raise ValueError("proxy is empty")
@@ -46,6 +46,7 @@ class SocksProxy:
                 password=unquote(parsed.password or ""),
             )
 
+        # Backward-compatible legacy format: host:port:user:password-with-colons
         parts = value.split(":")
         if len(parts) < 4:
             raise ValueError("use socks5://user:pass@host:port or host:port:user:pass")
@@ -61,7 +62,7 @@ class SocksProxy:
     @property
     def proxy_id(self) -> str:
         digest = sha256(
-            f"{self.host}\0{self.port}\0{self.username}\0{self.password}".encode("utf-8")
+            f"{self.host}\0{self.port}\0{self.username}\0{self.password}".encode()
         ).hexdigest()
         return f"proxy_{digest[:12]}"
 

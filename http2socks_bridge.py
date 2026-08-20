@@ -70,7 +70,7 @@ def socks5_connect(sock: socket.socket, target_host: str, target_port: int, prox
         except OSError:
             encoded = target_host.encode("idna")
             if len(encoded) > 255:
-                raise RuntimeError("target hostname is too long")
+                raise RuntimeError("target hostname is too long") from None
             address = b"\x03" + bytes([len(encoded)]) + encoded
 
     sock.sendall(b"\x05\x01\x00" + address + int(target_port).to_bytes(2, "big"))
@@ -282,7 +282,7 @@ def main() -> None:
         while not stop_event.is_set():
             try:
                 client, _ = server.accept()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             if not slots.acquire(blocking=False):
                 try:

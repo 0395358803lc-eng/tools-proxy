@@ -4,8 +4,8 @@ import os
 import re
 import subprocess
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Callable, Sequence
 
 from .models import CommandResult
 

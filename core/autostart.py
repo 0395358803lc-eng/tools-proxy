@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Callable
+from collections.abc import Callable
 
 from .bridge import BridgeRegistry
 from .emulator import EmulatorManager
@@ -55,7 +55,13 @@ class Supervisor:
                         self.callback(report)
                 except Exception as exc:
                     if self.callback:
-                        self.callback({"timestamp": time.strftime("%H:%M:%S"), "error": str(exc), "actions": []})
+                        self.callback(
+                            {
+                                "timestamp": time.strftime("%H:%M:%S"),
+                                "error": str(exc),
+                                "actions": [],
+                            }
+                        )
             self._stop.wait(self.interval)
 
     def supervise_once(self) -> dict:
@@ -75,7 +81,7 @@ class Supervisor:
             status = {}
 
         assignments = self.state.all_assignments()
-        for avd, assignment in assignments.items():
+        for avd in assignments:
             info = status.get(avd, {"running": False, "booted": False, "serial": None})
             entry = {
                 "running": bool(info.get("running")),
